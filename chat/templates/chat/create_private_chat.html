@@ -1,0 +1,46 @@
+{% extends 'chat/base.html' %}
+
+{% block title %}Create Private Chat - OffChat{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title mb-0">Start a Private Chat</h3>
+            </div>
+            <div class="card-body">
+                {% if error %}
+                    <div class="alert alert-danger" role="alert">
+                        {{ error }}
+                    </div>
+                {% endif %}
+                {% if not users %}
+                    <div class="alert alert-warning" role="alert">
+                        No users available to chat with.
+                    </div>
+                {% else %}
+                    <form method="post">
+                        {% csrf_token %}
+                        <div class="mb-3">
+                            <label for="selected_user" class="form-label">Select a user to chat with:</label>
+                            <select class="form-select" id="selected_user" name="selected_user" required>
+                                <option value="">Choose a user...</option>
+                                {% for user in users %}
+                                    <option value="{{ user.user_id }}">{{ user.display_name }} ({{ user.username }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">Start Chat</button>
+                        </div>
+                    </form>
+                {% endif %}
+            </div>
+        </div>
+        <div class="mt-3 text-center">
+            <a href="{% url 'chat_list' %}" class="btn btn-secondary w-100 w-sm-auto">Back to Chats</a>
+        </div>
+    </div>
+</div>
+{% endblock %}

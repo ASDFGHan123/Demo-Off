@@ -1,0 +1,20 @@
+{% extends "chat/base.html" %}
+
+{% block title %}Server Error{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-body text-center">
+                    <h1 class="display-1">500</h1>
+                    <h2 class="card-title">Internal Server Error</h2>
+                    <p class="card-text">Something went wrong on our end. Please try again later.</p>
+                    <a href="{% url 'chat_list' %}" class="btn btn-primary">Go to Chat List</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

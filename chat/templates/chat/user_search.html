@@ -1,0 +1,125 @@
+{% extends 'chat/base.html' %}
+
+{% block title %}Search Users - OffChat{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-12 col-md-8">
+        <h2 class="mb-4">Search Users</h2>
+
+        <div class="card">
+            <div class="card-body">
+                <div class="input-group mb-3">
+                    <input type="text" id="search-input" class="form-control" placeholder="Search by username or display name..." aria-label="Search users">
+                    <button class="btn btn-outline-secondary" type="button" id="clear-search">Clear</button>
+                </div>
+
+                <div id="search-results">
+                    <p class="text-muted">Start typing to search for users...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const searchInput = document.getElementById('search-input');
+    const searchResults = document.getElementById('search-results');
+    const clearButton = document.getElementById('clear-search');
+    let searchTimeout;
+
+    function performSearch() {
+        const query = searchInput.value.trim();
+
+        if (query.length === 0) {
+            searchResults.innerHTML = '<p class="text-muted">Start typing to search for users...</p>';
+            return;
+        }
+
+        fetch(`/search/?q=${encodeURIComponent(query)}`, {
+            method: 'GET',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRFToken': '{{ csrf_token }}'
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            displayResults(data.results);
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            searchResults.innerHTML = '<p class="text-danger">An error occurred while searching.</p>';
+        });
+    }
+
+    function displayResults(results) {
+        if (results.length === 0) {
+            searchResults.innerHTML = '<p class="text-muted">No users found.</p>';
+            return;
+        }
+
+        let html = '<div class="list-group">';
+        results.forEach(user => {
+        html += `
+            <div class="list-group-item d-flex align-items-center">
+                <div class="flex-shrink-0 me-3">
+                    ${user.profile_image_url ?
+                        `<img src="${user.profile_image_url}" alt="${user.display_name}" class="rounded-circle" style="width: 40px; height: 40px; object-fit: cover;">` :
+                        `<div class="bg-secondary rounded-circle d-flex align-items-center justify-content-center" style="width: 40px; height: 40px;"><span class="text-white fw-bold">${user.display_name.charAt(0).toUpperCase()}</span></div>`
+                    }
+                    <span class="position-absolute badge ${user.is_online ? 'bg-success' : 'bg-secondary'}" style="width: 12px; height: 12px; border-radius: 50%; top: 32px; left: 32px; border: 2px solid white;"></span>
+                </div>
+                <div class="flex-grow-1">
+                    <h6 class="mb-0">${user.display_name} ${user.is_online ? '<span class="badge bg-success">Online</span>' : '<span class="badge bg-secondary">Offline</span>'}</h6>
+                    <small class="text-muted">@${user.username}</small>
+                </div>
+                <div class="flex-shrink-0">
+                    <a href="{% url 'create_private_chat' %}" class="btn btn-sm btn-primary" onclick="startChat(${user.user_id})">Start Chat</a>
+                </div>
+            </div>
+        `;
+    });
+        html += '</div>';
+        searchResults.innerHTML = html;
+    }
+
+    function startChat(userId) {
+        // Create a form to submit the user selection
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '{% url "create_private_chat" %}';
+
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'selected_user';
+        input.value = userId;
+
+        const csrfInput = document.createElement('input');
+        csrfInput.type = 'hidden';
+        csrfInput.name = 'csrfmiddlewaretoken';
+        csrfInput.value = '{{ csrf_token }}';
+
+        form.appendChild(csrfInput);
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    // Debounced search on input
+    searchInput.addEventListener('input', function() {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(performSearch, 300);
+    });
+
+    // Clear search
+    clearButton.addEventListener('click', function() {
+        searchInput.value = '';
+        searchResults.innerHTML = '<p class="text-muted">Start typing to search for users...</p>';
+    });
+});
+</script>
+{% endblock %}
