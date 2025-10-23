@@ -8,7 +8,8 @@
 
     function connect() {
         const roomName = '{{ conversation.conversation_id }}';
-        chatSocket = new WebSocket('ws://' + window.location.host + '/ws/chat/' + roomName + '/');
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        chatSocket = new WebSocket(protocol + '//' + window.location.host + '/ws/chat/' + roomName + '/');
 
         chatSocket.onmessage = function(e) {
             const data = JSON.parse(e.data);
@@ -32,11 +33,31 @@
                 return;
             }
 
+            if (data.type === 'message_edited') {
+                // Update message content
+                updateMessageContent(data.message_id, data.content, data.edited_by);
+                return;
+            }
+
+            if (data.type === 'message_deleted') {
+                // Mark message as deleted
+                markMessageDeleted(data.message_id, data.deleted_by);
+                return;
+            }
+
             const messageElement = document.createElement('div');
             messageElement.className = 'message mb-2';
             messageElement.setAttribute('data-message-id', data.message_id);
 
             let messageHtml = '<strong>' + data.user + ':</strong> ' + data.message;
+
+            // Add edit/delete buttons for own messages
+            if (data.user_id == {{ user.user_id }}) {
+                messageHtml += '<div class="message-owner-actions mt-1">';
+                messageHtml += '<button class="btn btn-sm btn-outline-primary me-1" onclick="editMessage(' + data.message_id + ', \'' + data.message.replace(/'/g, '\\\'') + '\')">Edit</button>';
+                messageHtml += '<button class="btn btn-sm btn-outline-danger me-1" onclick="deleteMessage(' + data.message_id + ')">Delete</button>';
+                messageHtml += '</div>';
+            }
 
             if (data.reply_to) {
                 messageHtml += '<div class="reply-indicator ms-3 mt-1 p-2 border-start border-secondary"><small class="text-muted">Replying to ' + data.reply_to_sender + ': ' + data.reply_to_content.substring(0, 50) + (data.reply_to_content.length > 50 ? '...' : '') + '</small></div>';
@@ -52,6 +73,9 @@
             messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage(' + data.message_id + ', \'😂\')">😂</button>';
             messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="replyToMessage(' + data.message_id + ')">Reply</button>';
             messageHtml += '</div>';
+
+            // Store original content for edit cancellation
+            messageElement.setAttribute('data-original-content', data.message);
 
             messageHtml += '<div class="reactions mt-1" id="reactions-' + data.message_id + '">';
             if (data.reactions) {
@@ -145,6 +169,86 @@
         document.getElementById('reply-indicator').style.display = 'block';
         replyToMessageId = messageId;
         document.getElementById('message').focus();
+    }
+
+    function editMessage(messageId, currentContent) {
+        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+        const messageText = messageElement.querySelector('strong').nextSibling;
+
+        // Create inline edit form
+        const editForm = document.createElement('div');
+        editForm.className = 'edit-form mt-2';
+        editForm.innerHTML = `
+            <div class="input-group">
+                <input type="text" class="form-control form-control-sm" value="${currentContent.trim()}" id="edit-input-${messageId}">
+                <button class="btn btn-sm btn-success" onclick="saveEdit(${messageId})">Save</button>
+                <button class="btn btn-sm btn-secondary" onclick="cancelEdit(${messageId})">Cancel</button>
+            </div>
+        `;
+
+        // Hide original message text and show edit form
+        messageText.textContent = '';
+        messageElement.appendChild(editForm);
+        document.getElementById(`edit-input-${messageId}`).focus();
+    }
+
+    function saveEdit(messageId) {
+        const editInput = document.getElementById(`edit-input-${messageId}`);
+        const newContent = editInput.value.trim();
+
+        if (newContent) {
+            const editData = {
+                'type': 'edit_message',
+                'message_id': messageId,
+                'content': newContent
+            };
+            chatSocket.send(JSON.stringify(editData));
+        }
+    }
+
+    function cancelEdit(messageId) {
+        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+        const editForm = messageElement.querySelector('.edit-form');
+        if (editForm) {
+            editForm.remove();
+            // Restore original message text
+            const messageText = messageElement.querySelector('strong').nextSibling;
+            messageText.textContent = ' ' + messageElement.getAttribute('data-original-content');
+        }
+    }
+
+    function updateMessageContent(messageId, newContent, editedBy) {
+        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+        if (messageElement) {
+            const messageText = messageElement.querySelector('strong').nextSibling;
+            messageText.textContent = ' ' + newContent;
+
+            // Add edited indicator if not already present
+            if (!messageElement.querySelector('.edited-indicator')) {
+                const editedSpan = document.createElement('span');
+                editedSpan.className = 'edited-indicator text-muted ms-1';
+                editedSpan.textContent = '(edited)';
+                messageText.appendChild(editedSpan);
+            }
+        }
+    }
+
+    function markMessageDeleted(messageId, deletedBy) {
+        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+        if (messageElement) {
+            messageElement.innerHTML = '<em class="text-muted">This message was deleted</em>';
+            messageElement.className = 'message mb-2 text-muted';
+        }
+    }
+
+    function deleteMessage(messageId) {
+        if (confirm('Are you sure you want to delete this message?')) {
+            const deleteData = {
+                'type': 'delete_message',
+                'message_id': messageId
+            };
+            chatSocket.send(JSON.stringify(deleteData));
+        }
     }
 
     function cancelReply() {
@@ -244,9 +348,10 @@
 {% block content %}
 <div class="row">
     <div class="col-12">
-        <div class="d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center mb-4">
-            <h1 class="mb-3 mb-sm-0">{{ conversation.title|default:"Chat" }}</h1>
-            <a href="{% url 'chat_list' %}" class="btn btn-secondary w-100 w-sm-auto">Back to Chats</a>
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <a href="{% url 'chat_list' %}" class="btn btn-secondary">← Back to Chats</a>
+            <h1 class="mb-0 text-center flex-grow-1">{{ conversation.title|default:"Chat" }}</h1>
+            <div style="width: 120px;"></div> <!-- Spacer for centering -->
         </div>
 
         <!-- Online Status Display -->

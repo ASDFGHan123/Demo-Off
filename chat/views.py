@@ -325,10 +325,10 @@ def create_private_chat(request):
             return redirect('chat_detail', conversation_id=conversation.conversation_id)
 
         except User.DoesNotExist:
-            messages.error(request, 'User not found')
+            messages.error(request, 'The selected user could not be found. They may have been removed from the system.')
         except Exception as e:
             logger.error(f"Error creating private chat: {str(e)}")
-            messages.error(request, 'Failed to create chat')
+            messages.error(request, 'Unable to create chat at this time. Please try again later.')
 
     # Get users excluding current user
     users = User.objects.exclude(user_id=request.user.user_id)
@@ -482,6 +482,23 @@ def upload_attachment(request):
         message = Message.objects.get(message_id=message_id)
         if message.sender != request.user:
             return JsonResponse({'status': 'error', 'message': 'Access denied'})
+
+        # Validate file size (max 10MB)
+        max_size = 10 * 1024 * 1024  # 10MB
+        if file.size > max_size:
+            return JsonResponse({'status': 'error', 'message': 'File too large (max 10MB)'})
+
+        # Validate file type
+        allowed_types = [
+            'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+            'application/pdf', 'text/plain', 'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/zip', 'application/x-rar-compressed'
+        ]
+        if file.content_type not in allowed_types:
+            return JsonResponse({'status': 'error', 'message': 'File type not allowed'})
 
         # Create attachment
         attachment = Attachment.objects.create(

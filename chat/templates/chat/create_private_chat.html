@@ -10,14 +10,18 @@
                 <h3 class="card-title mb-0">Start a Private Chat</h3>
             </div>
             <div class="card-body">
-                {% if error %}
-                    <div class="alert alert-danger" role="alert">
-                        {{ error }}
-                    </div>
+                {% if messages %}
+                    {% for message in messages %}
+                        <div class="alert alert-{% if message.tags == 'error' %}danger{% else %}info{% endif %} alert-dismissible fade show" role="alert">
+                            {{ message }}
+                            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                        </div>
+                    {% endfor %}
                 {% endif %}
                 {% if not users %}
-                    <div class="alert alert-warning" role="alert">
-                        No users available to chat with.
+                    <div class="alert alert-info" role="alert">
+                        <h5 class="alert-heading">No Users Available</h5>
+                        <p class="mb-0">There are no other users registered in the system to chat with at this time.</p>
                     </div>
                 {% else %}
                     <form method="post">
@@ -39,7 +43,18 @@
             </div>
         </div>
         <div class="mt-3 text-center">
-            <a href="{% url 'chat_list' %}" class="btn btn-secondary w-100 w-sm-auto">Back to Chats</a>
+            <a href="{% url 'user_search' %}" class="btn btn-outline-primary me-2">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-search me-1" viewBox="0 0 16 16">
+                    <path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/>
+                </svg>
+                Search Users
+            </a>
+            <a href="{% url 'chat_list' %}" class="btn btn-secondary">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-left me-1" viewBox="0 0 16 16">
+                    <path fill-rule="evenodd" d="M15 8a.5.5 0 0 0-.5-.5H2.707l3.147-3.146a.5.5 0 1 0-.708-.708l-4 4a.5.5 0 0 0 0 .708l4 4a.5.5 0 0 1-.708.708L2.707 8.5H14.5A.5.5 0 0 0 15 8z"/>
+                </svg>
+                Back to Chats
+            </a>
         </div>
     </div>
 </div>

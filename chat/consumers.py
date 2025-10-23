@@ -53,6 +53,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
             # Broadcast online status to participants
             await self.broadcast_online_status(conversation, user, True)
 
+            # Deliver pending messages to the user
+            await self.deliver_pending_messages(user, conversation)
+
             logger.info(f"User {user.username} connected to room {self.room_name}")
             await self.accept()
         except Exception as e:
@@ -90,6 +93,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             if message_type == 'reaction':
                 await self.handle_reaction(text_data_json)
+            elif message_type == 'read_receipt':
+                await self.handle_read_receipt(text_data_json)
+            elif message_type == 'edit_message':
+                await self.handle_edit_message(text_data_json)
+            elif message_type == 'delete_message':
+                await self.handle_delete_message(text_data_json)
             else:
                 message_content = text_data_json.get('message', '').strip()
                 attachment_data = text_data_json.get('attachment')
@@ -171,6 +180,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
         reply_to_sender = event.get('reply_to_sender')
         reply_to_content = event.get('reply_to_content')
         reactions = event.get('reactions')
+
+        # Update message status to delivered for this user (if exists)
+        current_user = self.scope['user']
+        if current_user.user_id != user_id:  # Don't update for sender
+            await self.update_message_delivered(message_id, current_user)
 
         # Send message to WebSocket
         await self.send(text_data=json.dumps({
@@ -288,8 +302,49 @@ class ChatConsumer(AsyncWebsocketConsumer):
             'conversation_title': conversation_title,
         }))
 
+    # Receive read receipt from room group
+    async def read_receipt(self, event):
+        message_id = event['message_id']
+        user_id = event['user_id']
+        username = event['username']
+
+        # Send read receipt to WebSocket
+        await self.send(text_data=json.dumps({
+            'type': 'read_receipt',
+            'message_id': message_id,
+            'user_id': user_id,
+            'username': username,
+        }))
+
+    # Receive message edit from room group
+    async def message_edited(self, event):
+        message_id = event['message_id']
+        content = event['content']
+        edited_by = event['edited_by']
+
+        # Send message edit to WebSocket
+        await self.send(text_data=json.dumps({
+            'type': 'message_edited',
+            'message_id': message_id,
+            'content': content,
+            'edited_by': edited_by,
+        }))
+
+    # Receive message deletion from room group
+    async def message_deleted(self, event):
+        message_id = event['message_id']
+        deleted_by = event['deleted_by']
+
+        # Send message deletion to WebSocket
+        await self.send(text_data=json.dumps({
+            'type': 'message_deleted',
+            'message_id': message_id,
+            'deleted_by': deleted_by,
+        }))
+
     @sync_to_async
     def save_message(self, content, user, room_name, attachment_data=None, reply_to_id=None):
+        from .models import MessageStatus
         try:
             conversation = Conversation.objects.get(conversation_id=room_name)
             reply_to = None
@@ -315,6 +370,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     file_size=attachment_data['size'],
                 )
                 # Note: file field will be set via a separate upload endpoint
+
+            # Create message status for all participants except sender
+            participants = self.get_conversation_participants(conversation)
+            for participant in participants:
+                if participant != user:
+                    MessageStatus.objects.create(
+                        message=message,
+                        user=participant,
+                        status='sent'
+                    )
 
             return message
         except Conversation.DoesNotExist:
@@ -451,3 +516,235 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     )
         except Exception as e:
             logger.error(f"Error sending notification for conversation {conversation.conversation_id}: {str(e)}")
+
+    async def handle_read_receipt(self, data):
+        try:
+            message_id = data.get('message_id')
+            user = self.scope['user']
+
+            if not message_id:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'Message ID is required'
+                }))
+                return
+
+            # Update message status to read
+            await self.update_message_read_status(message_id, user)
+
+            # Broadcast read receipt to other participants
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    'type': 'read_receipt',
+                    'message_id': message_id,
+                    'user_id': user.user_id,
+                    'username': user.username,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error handling read receipt from user {self.scope['user'].username}: {str(e)}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Failed to process read receipt. Please try again.'
+            }))
+
+    async def handle_edit_message(self, data):
+        try:
+            message_id = data.get('message_id')
+            new_content = data.get('content', '').strip()
+            user = self.scope['user']
+
+            if not message_id or not new_content:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'Message ID and content are required'
+                }))
+                return
+
+            # Validate message length
+            if len(new_content) > 1000:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'Message is too long (max 1000 characters)'
+                }))
+                return
+
+            # Check if user can edit this message
+            message = await sync_to_async(Message.objects.get)(message_id=message_id)
+            if not user.can_edit_message(message):
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'You do not have permission to edit this message'
+                }))
+                return
+
+            # Update message
+            await self.update_message_content(message_id, new_content, user)
+
+            # Broadcast edit to all participants
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    'type': 'message_edited',
+                    'message_id': message_id,
+                    'content': new_content,
+                    'edited_by': user.username,
+                }
+            )
+        except Message.DoesNotExist:
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Message not found'
+            }))
+        except Exception as e:
+            logger.error(f"Error editing message from user {self.scope['user'].username}: {str(e)}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Failed to edit message. Please try again.'
+            }))
+
+    async def handle_delete_message(self, data):
+        try:
+            message_id = data.get('message_id')
+            user = self.scope['user']
+
+            if not message_id:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'Message ID is required'
+                }))
+                return
+
+            # Check if user can delete this message
+            message = await sync_to_async(Message.objects.get)(message_id=message_id)
+            if not user.can_delete_message(message):
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'You do not have permission to delete this message'
+                }))
+                return
+
+            # Soft delete message
+            await self.delete_message_content(message_id, user)
+
+            # Broadcast deletion to all participants
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    'type': 'message_deleted',
+                    'message_id': message_id,
+                    'deleted_by': user.username,
+                }
+            )
+        except Message.DoesNotExist:
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Message not found'
+            }))
+        except Exception as e:
+            logger.error(f"Error deleting message from user {self.scope['user'].username}: {str(e)}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Failed to delete message. Please try again.'
+            }))
+
+    @sync_to_async
+    def update_message_read_status(self, message_id, user):
+        from .models import MessageStatus
+        try:
+            MessageStatus.objects.filter(
+                message_id=message_id,
+                user=user
+            ).update(status='read')
+            logger.info(f"User {user.username} marked message {message_id} as read")
+        except Exception as e:
+            logger.error(f"Error updating read status for message {message_id}: {str(e)}")
+
+    @sync_to_async
+    def update_message_delivered(self, message_id, user):
+        from .models import MessageStatus
+        try:
+            MessageStatus.objects.filter(
+                message_id=message_id,
+                user=user,
+                status='sent'
+            ).update(status='delivered')
+            logger.info(f"User {user.username} received message {message_id}")
+        except Exception as e:
+            logger.error(f"Error updating delivered status for message {message_id}: {str(e)}")
+
+    @sync_to_async
+    def update_message_content(self, message_id, new_content, user):
+        try:
+            message = Message.objects.get(message_id=message_id)
+            message.content = new_content
+            message.is_edited = True
+            message.edited_at = None  # Will use auto_now
+            message.save(update_fields=['content', 'is_edited', 'edited_at'])
+            logger.info(f"User {user.username} edited message {message_id}")
+        except Message.DoesNotExist:
+            logger.warning(f"Message {message_id} not found when editing")
+        except Exception as e:
+            logger.error(f"Error updating message content for {message_id}: {str(e)}")
+            raise
+
+    @sync_to_async
+    def delete_message_content(self, message_id, user):
+        try:
+            message = Message.objects.get(message_id=message_id)
+            message.is_deleted = True
+            message.deleted_at = None  # Will use auto_now
+            message.save(update_fields=['is_deleted', 'deleted_at'])
+            logger.info(f"User {user.username} deleted message {message_id}")
+        except Message.DoesNotExist:
+            logger.warning(f"Message {message_id} not found when deleting")
+        except Exception as e:
+            logger.error(f"Error deleting message {message_id}: {str(e)}")
+            raise
+
+    async def deliver_pending_messages(self, user, conversation):
+        from .models import MessageStatus
+        try:
+            # Get all messages in this conversation that the user hasn't read yet
+            pending_messages = await sync_to_async(list)(
+                Message.objects.filter(
+                    conversation=conversation,
+                    messagestatus__user=user,
+                    messagestatus__status__in=['sent', 'delivered']
+                ).select_related('sender').prefetch_related('reaction_set').order_by('sent_at')
+            )
+
+            for message in pending_messages:
+                # Update status to delivered
+                await sync_to_async(
+                    MessageStatus.objects.filter(
+                        message=message,
+                        user=user
+                    ).update
+                )(status='delivered')
+
+                # Get reactions for the message
+                reactions = await self.get_message_reactions(message.message_id)
+
+                # Send the message to the user
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        'type': 'chat_message',
+                        'message': message.content,
+                        'user': message.sender.username,
+                        'user_id': message.sender.user_id,
+                        'timestamp': str(message.sent_at),
+                        'attachment': None,  # Pending messages don't have attachments in this implementation
+                        'message_id': message.message_id,
+                        'reply_to': message.reply_to.message_id if message.reply_to else None,
+                        'reply_to_sender': message.reply_to.sender.username if message.reply_to else None,
+                        'reply_to_content': message.reply_to.content if message.reply_to else None,
+                        'reactions': reactions,
+                    }
+                )
+
+            logger.info(f"Delivered {len(pending_messages)} pending messages to user {user.username} in conversation {conversation.conversation_id}")
+        except Exception as e:
+            logger.error(f"Error delivering pending messages to user {user.username}: {str(e)}")
