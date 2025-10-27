@@ -1,59 +1,68 @@
-{% extends 'chat/base.html' %}
+{% extends "base.html" %}
 
-{% block title %}Create Group Chat - OffChat{% endblock %}
+{% block title %}Create Group Chat{% endblock %}
 
 {% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-8">
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title mb-0">Create a Group Chat</h3>
-            </div>
-            <div class="card-body">
-                {% if error %}
-                    <div class="alert alert-danger" role="alert">
-                        {{ error }}
-                    </div>
-                {% endif %}
-                {% if not users %}
-                    <div class="alert alert-warning" role="alert">
-                        No users available to add to groups.
-                    </div>
-                {% else %}
+<div class="container mt-4">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title mb-0">Create Group Chat</h3>
+                </div>
+                <div class="card-body">
+                    {% if messages %}
+                        {% for message in messages %}
+                            <div class="alert alert-danger" role="alert">
+                                {{ message }}
+                            </div>
+                        {% endfor %}
+                    {% endif %}
+
                     <form method="post">
                         {% csrf_token %}
                         <div class="mb-3">
-                            <label for="title" class="form-label">Group Name *</label>
-                            <input type="text" class="form-control" id="title" name="title" required maxlength="100" placeholder="Enter group name">
+                            <label for="title" class="form-label">Group Title *</label>
+                            <input type="text" class="form-control" id="title" name="title" required maxlength="100">
+                            <div class="form-text">Choose a name for your group chat</div>
                         </div>
+
                         <div class="mb-3">
-                            <label for="description" class="form-label">Description (optional)</label>
-                            <textarea class="form-control" id="description" name="description" rows="3" maxlength="500" placeholder="Describe the group..."></textarea>
+                            <label for="description" class="form-label">Description</label>
+                            <textarea class="form-control" id="description" name="description" rows="3" maxlength="500"></textarea>
+                            <div class="form-text">Optional description for the group</div>
                         </div>
+
                         <div class="mb-3">
-                            <label class="form-label">Invite Members *</label>
-                            <div class="border rounded p-3" style="max-height: 300px; overflow-y: auto;">
+                            <label class="form-label">Add Members</label>
+                            <div id="members-list">
                                 {% for user in users %}
                                     <div class="form-check">
-                                        <input class="form-check-input" type="checkbox" value="{{ user.user_id }}" id="user_{{ user.user_id }}" name="selected_users">
+                                        <input class="form-check-input" type="checkbox" value="{{ user.user_id }}" id="user_{{ user.user_id }}" name="members">
                                         <label class="form-check-label" for="user_{{ user.user_id }}">
-                                            {{ user.display_name }} ({{ user.username }})
+                                            {{ user.display_name }} (@{{ user.username }})
                                         </label>
                                     </div>
                                 {% endfor %}
                             </div>
-                            <small class="form-text text-muted">Select at least one member to invite to the group.</small>
+                            <div class="form-text">Select users to add to the group (you will be added automatically as admin)</div>
                         </div>
-                        <div class="d-grid">
-                            <button type="submit" class="btn btn-success">Create Group</button>
+
+                        <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                            <a href="{% url 'chat_list' %}" class="btn btn-outline-secondary me-md-2">Cancel</a>
+                            <button type="submit" class="btn btn-primary">Create Group</button>
                         </div>
                     </form>
-                {% endif %}
+                </div>
             </div>
-        </div>
-        <div class="mt-3 text-center">
-            <a href="{% url 'chat_list' %}" class="btn btn-secondary w-100 w-sm-auto">Back to Chats</a>
         </div>
     </div>
 </div>
+
+<script>
+// Optional: Add some JavaScript for better UX
+document.addEventListener('DOMContentLoaded', function() {
+    // You could add search functionality or member selection enhancements here
+});
+</script>
 {% endblock %}

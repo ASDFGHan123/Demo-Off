@@ -7,6 +7,8 @@ from django.shortcuts import get_object_or_404
 from django.db import models
 from django.db.models import Q
 from django.contrib.postgres.search import SearchVector, SearchQuery, SearchRank
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
 import logging
 from .models import User, Conversation, Message, Attachment, PrivateChat, GroupChat, GroupMember
 from .serializers import UserSerializer, ConversationSerializer, MessageSerializer, AttachmentSerializer, MessageSearchSerializer
@@ -31,10 +33,9 @@ class UserDetailView(generics.RetrieveUpdateAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
-    lookup_field = 'user_id'
 
-    def get_queryset(self):
-        return User.objects.filter(user_id=self.request.user.user_id)
+    def get_object(self):
+        return self.request.user
 
     def retrieve(self, request, *args, **kwargs):
         try:
@@ -57,21 +58,8 @@ class ConversationListView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         try:
-            user = self.request.user
-            # Get private chats where user is user1 or user2
-            private_conversations = Conversation.objects.filter(
-                privatechat__user1=user
-            ) | Conversation.objects.filter(
-                privatechat__user2=user
-            )
-
-            # Get group chats where user is a member
-            group_conversations = Conversation.objects.filter(
-                groupchat__groupmember__user=user
-            )
-
-            # Combine the querysets using union
-            return private_conversations.union(group_conversations)
+            from .views import get_user_conversations
+            return get_user_conversations(self.request.user)
         except Exception as e:
             logger.error(f"Error getting conversations for user {self.request.user.username}: {str(e)}")
             return Conversation.objects.none()
@@ -98,15 +86,9 @@ class ConversationDetailView(generics.RetrieveAPIView):
             conversation = self.get_object()
             # Check if user has access to this conversation
             user = request.user
-            if conversation.type == 'private':
-                private_chat = conversation.privatechat
-                if not (private_chat.user1 == user or private_chat.user2 == user):
-                    logger.warning(f"User {user.username} attempted to access unauthorized conversation {conversation.conversation_id}")
-                    return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
-            elif conversation.type == 'group':
-                if not conversation.groupchat.groupmember_set.filter(user=user).exists():
-                    logger.warning(f"User {user.username} attempted to access unauthorized conversation {conversation.conversation_id}")
-                    return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+            if not user.can_access_conversation(conversation):
+                logger.warning(f"User {user.username} attempted to access unauthorized conversation {conversation.conversation_id}")
+                return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
 
             return super().retrieve(request, *args, **kwargs)
         except Conversation.DoesNotExist:
@@ -120,6 +102,7 @@ class ConversationDetailView(generics.RetrieveAPIView):
 class MessageListView(generics.ListCreateAPIView):
     serializer_class = MessageSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = PageNumberPagination
 
     def get_queryset(self):
         try:
@@ -128,15 +111,21 @@ class MessageListView(generics.ListCreateAPIView):
 
             # Check if user has access to this conversation
             user = self.request.user
-            if conversation.type == 'private':
-                private_chat = conversation.privatechat
-                if not (private_chat.user1 == user or private_chat.user2 == user):
-                    return Message.objects.none()
-            elif conversation.type == 'group':
-                if not conversation.groupchat.groupmember_set.filter(user=user).exists():
-                    return Message.objects.none()
+            if not user.can_access_conversation(conversation):
+                return Message.objects.none()
 
-            return Message.objects.filter(conversation_id=conversation_id).order_by('sent_at')
+            # Optimized query with select_related and prefetch_related
+            return Message.objects.filter(
+                conversation_id=conversation_id,
+                is_deleted=False
+            ).select_related(
+                'sender',
+                'reply_to',
+                'reply_to__sender'
+            ).prefetch_related(
+                'reaction_set',
+                'attachment_set'
+            ).order_by('sent_at')
         except Conversation.DoesNotExist:
             logger.warning(f"User {self.request.user.username} attempted to access messages from non-existent conversation {self.kwargs.get('conversation_id')}")
             return Message.objects.none()
@@ -146,7 +135,14 @@ class MessageListView(generics.ListCreateAPIView):
 
     def list(self, request, *args, **kwargs):
         try:
-            return super().list(request, *args, **kwargs)
+            # Add pagination for large chat histories
+            page = self.paginate_queryset(self.get_queryset())
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(self.get_queryset(), many=True)
+            return Response(serializer.data)
         except Exception as e:
             logger.error(f"Error listing messages for {request.user.username}: {str(e)}")
             return Response({'error': 'Failed to retrieve messages'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -158,13 +154,8 @@ class MessageListView(generics.ListCreateAPIView):
 
             # Check if user has access to this conversation
             user = self.request.user
-            if conversation.type == 'private':
-                private_chat = conversation.privatechat
-                if not (private_chat.user1 == user or private_chat.user2 == user):
-                    raise PermissionError("Access denied")
-            elif conversation.type == 'group':
-                if not conversation.groupchat.groupmember_set.filter(user=user).exists():
-                    raise PermissionError("Access denied")
+            if not user.can_access_conversation(conversation):
+                raise PermissionError("Access denied")
 
             serializer.save(conversation=conversation)
         except Conversation.DoesNotExist:
@@ -217,16 +208,8 @@ class AttachmentListView(generics.ListCreateAPIView):
             if message_id:
                 # Check if user has access to the message
                 message = Message.objects.filter(message_id=message_id).first()
-                if message:
-                    conversation = message.conversation
-                    user = self.request.user
-                    if conversation.type == 'private':
-                        private_chat = conversation.privatechat
-                        if not (private_chat.user1 == user or private_chat.user2 == user):
-                            return Attachment.objects.none()
-                    elif conversation.type == 'group':
-                        if not conversation.groupchat.groupmember_set.filter(user=user).exists():
-                            return Attachment.objects.none()
+                if message and not self.request.user.can_access_conversation(message.conversation):
+                    return Attachment.objects.none()
                 return Attachment.objects.filter(message_id=message_id)
             return Attachment.objects.filter(message__sender=self.request.user)
         except Exception as e:
@@ -264,17 +247,10 @@ class AttachmentDetailView(generics.RetrieveAPIView):
             attachment = self.get_object()
             # Check if user has access to the attachment's message
             message = attachment.message
-            conversation = message.conversation
             user = request.user
-            if conversation.type == 'private':
-                private_chat = conversation.privatechat
-                if not (private_chat.user1 == user or private_chat.user2 == user):
-                    logger.warning(f"User {user.username} attempted to access unauthorized attachment {attachment.attachment_id}")
-                    return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
-            elif conversation.type == 'group':
-                if not conversation.groupchat.groupmember_set.filter(user=user).exists():
-                    logger.warning(f"User {user.username} attempted to access unauthorized attachment {attachment.attachment_id}")
-                    return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+            if not user.can_access_conversation(message.conversation):
+                logger.warning(f"User {user.username} attempted to access unauthorized attachment {attachment.attachment_id}")
+                return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
 
             return super().retrieve(request, *args, **kwargs)
         except Attachment.DoesNotExist:
@@ -303,13 +279,8 @@ class MessageSearchView(generics.ListAPIView):
             user = self.request.user
 
             # Get conversations the user has access to
-            private_conversations = Conversation.objects.filter(
-                Q(privatechat__user1=user) | Q(privatechat__user2=user)
-            )
-            group_conversations = Conversation.objects.filter(
-                groupchat__groupmember__user=user
-            )
-            accessible_conversations = private_conversations.union(group_conversations)
+            from .views import get_user_conversations
+            accessible_conversations = get_user_conversations(user)
 
             # Filter messages by accessible conversations and search query
             # Using PostgreSQL full-text search if available, otherwise fallback to icontains
@@ -387,6 +358,41 @@ def create_private_chat(request):
     except Exception as e:
         logger.error(f"Error creating private chat for user {request.user.username}: {str(e)}")
         return Response({'error': 'Failed to create private chat'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['POST'])
+@permission_classes([])  # Allow unauthenticated access for registration
+@method_decorator(csrf_exempt, name='dispatch')
+def register_user(request):
+    try:
+        username = request.data.get('username')
+        email = request.data.get('email')
+        password = request.data.get('password')
+        display_name = request.data.get('display_name')
+
+        if not username or not password or not display_name:
+            return Response({'error': 'Username, password, and display name are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check for existing username
+        if User.objects.filter(username=username).exists():
+            return Response({'error': 'Username taken'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check for existing email only if email is provided
+        if email and User.objects.filter(email=email).exists():
+            return Response({'error': 'Email already registered'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.create_user(username=username, email=email if email else None, password=password, display_name=display_name)
+            # Log the user in
+            from django.contrib.auth import login
+            login(request, user)
+            serializer = UserSerializer(user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.error(f"Registration error: {str(e)}")
+            return Response({'error': 'Registration failed. Please try again.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        logger.error(f"Error registering user: {str(e)}")
+        return Response({'error': 'Failed to register user'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])

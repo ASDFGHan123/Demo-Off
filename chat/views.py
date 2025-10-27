@@ -36,7 +36,7 @@ def admin_panel(request):
     except Exception as e:
         logger.error(f"Error loading admin panel for user {request.user.username}: {str(e)}")
         return render(request, 'chat/500.html', status=500)
-
+    
 @permission_required('manage_users')
 def manage_users(request):
     try:
@@ -244,6 +244,17 @@ class RegisterView(View):
 
         try:
             user = User.objects.create_user(username=username, email=email if email else None, password=password, display_name=display_name)
+
+            # Automatically assign 'user' role to new users
+            try:
+                from .models import Role, UserRole
+                user_role = Role.objects.get(name='user')
+                UserRole.objects.create(user=user, role=user_role)
+            except Role.DoesNotExist:
+                logger.warning("Default 'user' role not found. User created without role assignment.")
+            except Exception as e:
+                logger.error(f"Error assigning default role to user {username}: {str(e)}")
+
             login(request, user)
             return redirect('chat_list')
         except Exception as e:
@@ -253,21 +264,7 @@ class RegisterView(View):
 
 @login_required
 def chat_list(request):
-    # Get private chats where user is user1 or user2
-    private_conversations = Conversation.objects.filter(
-        privatechat__user1=request.user
-    ) | Conversation.objects.filter(
-        privatechat__user2=request.user
-    )
-
-    # Get group chats where user is a member
-    group_conversations = Conversation.objects.filter(
-        groupchat__groupmember__user=request.user
-    )
-
-    # Combine the querysets using union (distinct is implicit in union)
-    conversations = private_conversations.union(group_conversations)
-
+    conversations = get_user_conversations(request.user)
     return render(request, 'chat/chat_list.html', {'conversations': conversations})
 
 @login_required
@@ -276,15 +273,16 @@ def chat_detail(request, conversation_id):
         conversation = Conversation.objects.get(conversation_id=conversation_id)
 
         # Check if user has access to this conversation
-        if conversation.type == 'private':
-            private_chat = conversation.privatechat
-            if request.user not in [private_chat.user1, private_chat.user2]:
-                messages.error(request, 'You do not have access to this conversation')
-                return redirect('chat_list')
-        else:  # group chat
-            if not conversation.groupchat.groupmember_set.filter(user=request.user).exists():
-                messages.error(request, 'You do not have access to this conversation')
-                return redirect('chat_list')
+        if not request.user.can_access_conversation(conversation):
+            # Check if user is authenticated but not a member
+            if request.user.is_authenticated:
+                error_message = 'You are not a member of this conversation'
+            else:
+                error_message = 'You must be logged in to access this conversation'
+            return render(request, 'chat/access_denied.html', {
+                'conversation': conversation,
+                'error_message': error_message
+            })
 
         messages_list = Message.objects.filter(conversation=conversation).select_related('sender').prefetch_related('reaction_set').order_by('sent_at')
         return render(request, 'chat/chat_detail.html', {'conversation': conversation, 'messages': messages_list})
@@ -300,7 +298,7 @@ def chat_detail(request, conversation_id):
 @login_required
 def create_private_chat(request):
     if request.method == 'POST':
-        other_user_id = request.POST.get('other_user')
+        other_user_id = request.POST.get('selected_user')
         try:
             other_user = User.objects.get(user_id=other_user_id)
 
@@ -409,26 +407,19 @@ def user_search(request):
 
     return render(request, 'chat/user_search.html', {'results': results, 'query': query})
 
-@method_decorator(csrf_exempt, name='dispatch')
 class SendMessageView(View):
     def post(self, request, conversation_id):
         try:
-            data = json.loads(request.body)
-            content = data.get('content', '').strip()
-            reply_to_id = data.get('reply_to')
+            content = request.POST.get('content', '').strip()
+            reply_to_id = request.POST.get('reply_to')
 
             if not content:
                 return JsonResponse({'status': 'error', 'message': 'Message content is required'})
 
             # Verify conversation access
             conversation = Conversation.objects.get(conversation_id=conversation_id)
-            if conversation.type == 'private':
-                private_chat = conversation.privatechat
-                if request.user not in [private_chat.user1, private_chat.user2]:
-                    return JsonResponse({'status': 'error', 'message': 'Access denied'})
-            else:
-                if not conversation.groupchat.groupmember_set.filter(user=request.user).exists():
-                    return JsonResponse({'status': 'error', 'message': 'Access denied'})
+            if not request.user.can_access_conversation(conversation):
+                return JsonResponse({'status': 'error', 'message': 'You do not have permission to send messages in this conversation'})
 
             # Create message
             message = Message.objects.create(
@@ -450,10 +441,26 @@ class SendMessageView(View):
                 }
             })
 
+            # Send real-time notification via WebSocket
+            from channels.layers import get_channel_layer
+            from asgiref.sync import async_to_sync
+
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                f'chat_{conversation_id}',
+                {
+                    'type': 'chat_message',
+                    'message': content,
+                    'user': request.user.username,
+                    'user_id': request.user.user_id,
+                    'timestamp': str(message.sent_at),
+                    'message_id': message.message_id,
+                    'reply_to': reply_to_id,
+                }
+            )
+
         except Conversation.DoesNotExist:
             return JsonResponse({'status': 'error', 'message': 'Conversation not found'})
-        except json.JSONDecodeError:
-            return JsonResponse({'status': 'error', 'message': 'Invalid JSON'})
         except Exception as e:
             logger.error(f"Error sending message: {str(e)}")
             return JsonResponse({'status': 'error', 'message': 'Failed to send message'})
@@ -481,7 +488,7 @@ def upload_attachment(request):
         # Verify message ownership
         message = Message.objects.get(message_id=message_id)
         if message.sender != request.user:
-            return JsonResponse({'status': 'error', 'message': 'Access denied'})
+            return JsonResponse({'status': 'error', 'message': 'You can only upload attachments to your own messages'})
 
         # Validate file size (max 10MB)
         max_size = 10 * 1024 * 1024  # 10MB
@@ -525,9 +532,29 @@ def upload_attachment(request):
     except Exception as e:
         logger.error(f"Error uploading attachment: {str(e)}")
         return JsonResponse({'status': 'error', 'message': 'Upload failed'})
+
+def get_client_ip(request):
+    """Get the client IP address from the request."""
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
     if x_forwarded_for:
         ip = x_forwarded_for.split(',')[0]
     else:
         ip = request.META.get('REMOTE_ADDR')
     return ip
+
+def get_user_conversations(user):
+    """Get all conversations for a user (private and group)."""
+    # Get private chats where user is user1 or user2
+    private_conversations = Conversation.objects.filter(
+        privatechat__user1=user
+    ) | Conversation.objects.filter(
+        privatechat__user2=user
+    )
+
+    # Get group chats where user is a member
+    group_conversations = Conversation.objects.filter(
+        groupchat__groupmember__user=user
+    )
+
+    # Combine the querysets using union (distinct is implicit in union)
+    return private_conversations.union(group_conversations)

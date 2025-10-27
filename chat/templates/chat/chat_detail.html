@@ -1,431 +1,231 @@
-{% extends 'chat/base.html' %}
-
-{% block title %}{{ conversation.title|default:"Chat" }} - OffChat{% endblock %}
-
-{% block extra_js %}
-<script>
-    let chatSocket;
-
-    function connect() {
-        const roomName = '{{ conversation.conversation_id }}';
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        chatSocket = new WebSocket(protocol + '//' + window.location.host + '/ws/chat/' + roomName + '/');
-
-        chatSocket.onmessage = function(e) {
-            const data = JSON.parse(e.data);
-            const messagesDiv = document.getElementById('messages');
-
-            if (data.type === 'reaction') {
-                // Update reactions for existing message
-                updateMessageReactions(data.message_id, data.reactions);
-                return;
-            }
-
-            if (data.type === 'user_status') {
-                // Update user online status
-                updateUserStatus(data.user_id, data.is_online);
-                return;
-            }
-
-            if (data.type === 'notification') {
-                // Show browser notification
-                showNotification(data.sender, data.message, data.conversation_title, data.conversation_id);
-                return;
-            }
-
-            if (data.type === 'message_edited') {
-                // Update message content
-                updateMessageContent(data.message_id, data.content, data.edited_by);
-                return;
-            }
-
-            if (data.type === 'message_deleted') {
-                // Mark message as deleted
-                markMessageDeleted(data.message_id, data.deleted_by);
-                return;
-            }
-
-            const messageElement = document.createElement('div');
-            messageElement.className = 'message mb-2';
-            messageElement.setAttribute('data-message-id', data.message_id);
-
-            let messageHtml = '<strong>' + data.user + ':</strong> ' + data.message;
-
-            // Add edit/delete buttons for own messages
-            if (data.user_id == {{ user.user_id }}) {
-                messageHtml += '<div class="message-owner-actions mt-1">';
-                messageHtml += '<button class="btn btn-sm btn-outline-primary me-1" onclick="editMessage(' + data.message_id + ', \'' + data.message.replace(/'/g, '\\\'') + '\')">Edit</button>';
-                messageHtml += '<button class="btn btn-sm btn-outline-danger me-1" onclick="deleteMessage(' + data.message_id + ')">Delete</button>';
-                messageHtml += '</div>';
-            }
-
-            if (data.reply_to) {
-                messageHtml += '<div class="reply-indicator ms-3 mt-1 p-2 border-start border-secondary"><small class="text-muted">Replying to ' + data.reply_to_sender + ': ' + data.reply_to_content.substring(0, 50) + (data.reply_to_content.length > 50 ? '...' : '') + '</small></div>';
-            }
-
-            if (data.attachment) {
-                messageHtml += '<br><small><a href="' + data.attachment.url + '" target="_blank">' + data.attachment.name + '</a></small>';
-            }
-
-            messageHtml += '<div class="message-actions mt-1">';
-            messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage(' + data.message_id + ', \'👍\')">👍</button>';
-            messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage(' + data.message_id + ', \'❤️\')">❤️</button>';
-            messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage(' + data.message_id + ', \'😂\')">😂</button>';
-            messageHtml += '<button class="btn btn-sm btn-outline-secondary me-1" onclick="replyToMessage(' + data.message_id + ')">Reply</button>';
-            messageHtml += '</div>';
-
-            // Store original content for edit cancellation
-            messageElement.setAttribute('data-original-content', data.message);
-
-            messageHtml += '<div class="reactions mt-1" id="reactions-' + data.message_id + '">';
-            if (data.reactions) {
-                data.reactions.forEach(function(reaction) {
-                    messageHtml += '<span class="badge bg-light text-dark me-1">' + reaction.emoji + ' ' + reaction.user + '</span>';
-                });
-            }
-            messageHtml += '</div>';
-
-            messageElement.innerHTML = messageHtml;
-            messagesDiv.appendChild(messageElement);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        };
-
-        function updateMessageReactions(messageId, reactions) {
-            const reactionsDiv = document.getElementById('reactions-' + messageId);
-            if (reactionsDiv) {
-                reactionsDiv.innerHTML = '';
-                reactions.forEach(function(reaction) {
-                    const badge = document.createElement('span');
-                    badge.className = 'badge bg-light text-dark me-1';
-                    badge.textContent = reaction.emoji + ' ' + reaction.user;
-                    reactionsDiv.appendChild(badge);
-                });
-            }
-        }
-
-        function updateUserStatus(userId, isOnline) {
-            // Update status indicators in the chat interface
-            const statusElements = document.querySelectorAll(`[data-user-id="${userId}"] .user-status`);
-            statusElements.forEach(element => {
-                element.className = `user-status badge ${isOnline ? 'bg-success' : 'bg-secondary'}`;
-                element.textContent = isOnline ? 'Online' : 'Offline';
-            });
-        }
-
-        chatSocket.onclose = function(e) {
-            console.error('Chat socket closed unexpectedly');
-        };
-    }
-
-    let replyToMessageId = null;
-
-    function sendMessage() {
-        const messageInput = document.getElementById('message');
-        const fileInput = document.getElementById('file');
-        const message = messageInput.value;
-        const file = fileInput.files[0];
-
-        if (message || file) {
-            const messageData = {'message': message};
-
-            if (replyToMessageId) {
-                messageData.reply_to = replyToMessageId;
-            }
-
-            if (file) {
-                // First send message with attachment metadata
-                messageData.attachment = {
-                    'name': file.name,
-                    'type': file.type,
-                    'size': file.size
-                };
-
-                // Upload file separately
-                uploadFile(file);
-            }
-
-            chatSocket.send(JSON.stringify(messageData));
-            messageInput.value = '';
-            fileInput.value = '';
-            cancelReply();
-        }
-    }
-
-    function reactToMessage(messageId, emoji) {
-        const reactionData = {
-            'type': 'reaction',
-            'message_id': messageId,
-            'emoji': emoji
-        };
-        chatSocket.send(JSON.stringify(reactionData));
-    }
-
-    function replyToMessage(messageId) {
-        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
-        const senderName = messageElement.querySelector('strong').textContent.replace(':', '');
-        const messageContent = messageElement.textContent.split(':')[1].trim().split('\n')[0];
-
-        document.getElementById('reply-text').textContent = `${senderName}: ${messageContent}`;
-        document.getElementById('reply-indicator').style.display = 'block';
-        replyToMessageId = messageId;
-        document.getElementById('message').focus();
-    }
-
-    function editMessage(messageId, currentContent) {
-        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
-        const messageText = messageElement.querySelector('strong').nextSibling;
-
-        // Create inline edit form
-        const editForm = document.createElement('div');
-        editForm.className = 'edit-form mt-2';
-        editForm.innerHTML = `
-            <div class="input-group">
-                <input type="text" class="form-control form-control-sm" value="${currentContent.trim()}" id="edit-input-${messageId}">
-                <button class="btn btn-sm btn-success" onclick="saveEdit(${messageId})">Save</button>
-                <button class="btn btn-sm btn-secondary" onclick="cancelEdit(${messageId})">Cancel</button>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>
+        {% if conversation.type == 'private' %}
+            {% if conversation.privatechat.user1 == user %}
+                {{ conversation.privatechat.user2.display_name }}
+            {% else %}
+                {{ conversation.privatechat.user1.display_name }}
+            {% endif %}
+        {% else %}
+            {{ conversation.title|default:"Group Chat" }}
+        {% endif %}
+         - OffChat
+    </title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="{% url 'chat_list' %}">OffChat</a>
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="{% url 'chat_list' %}">Back to Chats</a>
+                <a class="nav-link" href="{% url 'logout' %}">Logout</a>
             </div>
-        `;
-
-        // Hide original message text and show edit form
-        messageText.textContent = '';
-        messageElement.appendChild(editForm);
-        document.getElementById(`edit-input-${messageId}`).focus();
-    }
-
-    function saveEdit(messageId) {
-        const editInput = document.getElementById(`edit-input-${messageId}`);
-        const newContent = editInput.value.trim();
-
-        if (newContent) {
-            const editData = {
-                'type': 'edit_message',
-                'message_id': messageId,
-                'content': newContent
-            };
-            chatSocket.send(JSON.stringify(editData));
-        }
-    }
-
-    function cancelEdit(messageId) {
-        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
-        const editForm = messageElement.querySelector('.edit-form');
-        if (editForm) {
-            editForm.remove();
-            // Restore original message text
-            const messageText = messageElement.querySelector('strong').nextSibling;
-            messageText.textContent = ' ' + messageElement.getAttribute('data-original-content');
-        }
-    }
-
-    function updateMessageContent(messageId, newContent, editedBy) {
-        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
-        if (messageElement) {
-            const messageText = messageElement.querySelector('strong').nextSibling;
-            messageText.textContent = ' ' + newContent;
-
-            // Add edited indicator if not already present
-            if (!messageElement.querySelector('.edited-indicator')) {
-                const editedSpan = document.createElement('span');
-                editedSpan.className = 'edited-indicator text-muted ms-1';
-                editedSpan.textContent = '(edited)';
-                messageText.appendChild(editedSpan);
-            }
-        }
-    }
-
-    function markMessageDeleted(messageId, deletedBy) {
-        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
-        if (messageElement) {
-            messageElement.innerHTML = '<em class="text-muted">This message was deleted</em>';
-            messageElement.className = 'message mb-2 text-muted';
-        }
-    }
-
-    function deleteMessage(messageId) {
-        if (confirm('Are you sure you want to delete this message?')) {
-            const deleteData = {
-                'type': 'delete_message',
-                'message_id': messageId
-            };
-            chatSocket.send(JSON.stringify(deleteData));
-        }
-    }
-
-    function cancelReply() {
-        document.getElementById('reply-indicator').style.display = 'none';
-        replyToMessageId = null;
-    }
-
-    function uploadFile(file) {
-        const formData = new FormData();
-        formData.append('file', file);
-        // Note: message_id would need to be obtained after sending the message
-
-        fetch('/upload-attachment/', {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value
-            }
-        });
-    }
-
-    function showNotification(sender, message, conversationTitle, conversationId) {
-        // Check if notifications are supported and permission is granted
-        if (!('Notification' in window)) {
-            console.log('This browser does not support desktop notifications');
-            return;
-        }
-
-        if (Notification.permission === 'granted') {
-            const notification = new Notification(`${sender} in ${conversationTitle}`, {
-                body: message,
-                icon: '/static/favicon.ico', // You can add an icon
-                tag: `chat-${conversationId}`, // Prevents duplicate notifications
-                requireInteraction: false,
-            });
-
-            // Auto-close after 5 seconds
-            setTimeout(() => {
-                notification.close();
-            }, 5000);
-
-            // Click to focus on the chat
-            notification.onclick = function() {
-                window.focus();
-                notification.close();
-            };
-
-            // Play sound if enabled
-            if ({{ user.notification_sound|yesno:"true,false" }}) {
-                playNotificationSound();
-            }
-        } else if (Notification.permission !== 'denied') {
-            // Request permission
-            Notification.requestPermission().then(function(permission) {
-                if (permission === 'granted') {
-                    showNotification(sender, message, conversationTitle, conversationId);
-                }
-            });
-        }
-    }
-
-    function playNotificationSound() {
-        // Create a simple beep sound
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const oscillator = audioContext.createOscillator();
-        const gainNode = audioContext.createGain();
-
-        oscillator.connect(gainNode);
-        gainNode.connect(audioContext.destination);
-
-        oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
-        oscillator.frequency.setValueAtTime(600, audioContext.currentTime + 0.1);
-
-        gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
-
-        oscillator.start(audioContext.currentTime);
-        oscillator.stop(audioContext.currentTime + 0.3);
-    }
-
-    document.addEventListener('DOMContentLoaded', function() {
-        connect();
-        document.getElementById('message').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
-            }
-        });
-
-        // Request notification permission on page load if notifications are enabled
-        if ({{ user.enable_notifications|yesno:"true,false" }} && 'Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission();
-        }
-    });
-</script>
-{% endblock %}
-
-{% block content %}
-<div class="row">
-    <div class="col-12">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <a href="{% url 'chat_list' %}" class="btn btn-secondary">← Back to Chats</a>
-            <h1 class="mb-0 text-center flex-grow-1">{{ conversation.title|default:"Chat" }}</h1>
-            <div style="width: 120px;"></div> <!-- Spacer for centering -->
         </div>
+    </nav>
 
-        <!-- Online Status Display -->
-        <div class="card mb-3">
-            <div class="card-body">
-                <h6 class="card-title">Participants</h6>
-                <div class="d-flex flex-wrap gap-2">
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-md-8">
+                <h2>
                     {% if conversation.type == 'private' %}
-                        {% for user in conversation.privatechat.get_participants %}
-                            <div class="d-flex align-items-center flex-column flex-sm-row text-center text-sm-start" data-user-id="{{ user.user_id }}">
-                                <span class="me-sm-2 mb-1 mb-sm-0">{{ user.display_name }}</span>
-                                <span class="user-status badge {{ user.is_online|yesno:'bg-success,bg-secondary' }}">{{ user.is_online|yesno:'Online,Offline' }}</span>
-                            </div>
-                        {% endfor %}
-                    {% elif conversation.type == 'group' %}
-                        {% for member in conversation.groupchat.groupmember_set.all %}
-                            <div class="d-flex align-items-center flex-column flex-sm-row text-center text-sm-start" data-user-id="{{ member.user.user_id }}">
-                                <span class="me-sm-2 mb-1 mb-sm-0">{{ member.user.display_name }}</span>
-                                <span class="user-status badge {{ member.user.is_online|yesno:'bg-success,bg-secondary' }}">{{ member.user.is_online|yesno:'Online,Offline' }}</span>
-                            </div>
-                        {% endfor %}
+                        {% if conversation.privatechat.user1 == user %}
+                            {{ conversation.privatechat.user2.display_name }}
+                        {% else %}
+                            {{ conversation.privatechat.user1.display_name }}
+                        {% endif %}
+                    {% else %}
+                        {{ conversation.title|default:"Group Chat" }}
                     {% endif %}
-                </div>
-            </div>
-        </div>
+                </h2>
 
-        <div class="card">
-            <div class="card-body">
-                <div id="messages" class="chat-messages p-3" style="height: 400px; overflow-y: auto; background-color: #f8f9fa; min-height: 200px;">
+                <div id="messages" class="border rounded p-3 mb-3" style="height: 400px; overflow-y: auto;">
                     {% for message in messages %}
-                        <div class="message mb-2" data-message-id="{{ message.message_id }}">
-                            <strong>{{ message.sender.display_name }}:</strong> {{ message.content }}
-                            {% if message.reply_to %}
-                                <div class="reply-indicator ms-3 mt-1 p-2 border-start border-secondary">
-                                    <small class="text-muted">Replying to {{ message.reply_to.sender.display_name }}: {{ message.reply_to.content|truncatechars:50 }}</small>
-                                </div>
-                            {% endif %}
-                            {% if message.attachment_set.exists %}
-                                {% for attachment in message.attachment_set.all %}
-                                    <br><small><a href="{{ attachment.file.url }}" target="_blank">{{ attachment.file_name }}</a> ({{ attachment.file_size }} bytes)</small>
-                                {% endfor %}
-                            {% endif %}
-                            <div class="message-actions mt-1">
-                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage({{ message.message_id }}, '👍')">👍</button>
-                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage({{ message.message_id }}, '❤️')">❤️</button>
-                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="reactToMessage({{ message.message_id }}, '😂')">😂</button>
-                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="replyToMessage({{ message.message_id }})">Reply</button>
-                            </div>
-                            <div class="reactions mt-1">
-                                {% for reaction in message.reaction_set.all %}
-                                    <span class="badge bg-light text-dark me-1">{{ reaction.emoji }} {{ reaction.user.display_name }}</span>
-                                {% endfor %}
+                        <div class="message mb-2 {% if message.sender == user %}text-end{% endif %}">
+                            <div class="d-inline-block p-2 rounded {% if message.sender == user %}bg-primary text-white{% else %}bg-light{% endif %}">
+                                <strong>{{ message.sender.display_name }}:</strong> {{ message.content }}
+                                <small class="text-muted d-block">{{ message.sent_at|date:"M d, H:i" }}</small>
                             </div>
                         </div>
+                    {% empty %}
+                        <p class="text-muted text-center">No messages yet. Start the conversation!</p>
                     {% endfor %}
                 </div>
+
+                <form id="message-form" method="post" action="{% url 'send_message' conversation.conversation_id %}">
+                    {% csrf_token %}
+                    <div class="input-group">
+                        <input type="text" id="message-input" name="content" class="form-control" placeholder="Type your message..." required>
+                        <button type="submit" class="btn btn-primary">Send</button>
+                    </div>
+                </form>
+
+                <div id="response-message" class="mt-2" style="display: none;"></div>
+
+                <!-- WebSocket connection -->
+                <script>
+                    const conversationId = "{{ conversation.conversation_id }}";
+                    const currentUserId = "{{ user.user_id }}";
+                    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = wsProtocol + '//' + '192.168.2.9:8000' + '/ws/chat/' + conversationId + '/';
+                    const chatSocket = new WebSocket(wsUrl);
+
+                    chatSocket.onopen = function(e) {
+                        console.log('WebSocket connection established');
+                        // Add connection status indicator
+                        const statusDiv = document.createElement('div');
+                        statusDiv.id = 'connection-status';
+                        statusDiv.className = 'alert alert-success mt-2';
+                        statusDiv.innerHTML = 'Connected to chat server';
+                        const container = document.querySelector('.container');
+                        container.insertBefore(statusDiv, container.firstChild.nextSibling);
+                    };
+
+                    chatSocket.onmessage = function(e) {
+                        const data = JSON.parse(e.data);
+                        console.log('Received message:', data);
+                        if (data.message) {
+                            // Add new message to the chat without refreshing
+                            const messagesDiv = document.getElementById('messages');
+                            const messageDiv = document.createElement('div');
+                            messageDiv.className = 'message mb-2';
+                            if (data.user_id == currentUserId) {
+                                messageDiv.classList.add('text-end');
+                            }
+                            const bgClass = (data.user_id == currentUserId) ? 'bg-primary text-white' : 'bg-light';
+                            messageDiv.innerHTML = '<div class="d-inline-block p-2 rounded ' + bgClass + '">' +
+                                '<strong>' + data.user + ':</strong> ' + data.message +
+                                '<small class="text-muted d-block">' + new Date(data.timestamp).toLocaleString() + '</small>' +
+                                '</div>';
+                            messagesDiv.appendChild(messageDiv);
+                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        } else if (data.type === 'user_status') {
+                            console.log('User status update:', data);
+                        } else if (data.type === 'reaction') {
+                            console.log('Reaction update:', data);
+                        } else if (data.type === 'notification') {
+                            console.log('Notification:', data);
+                        }
+                    };
+
+                    chatSocket.onclose = function(e) {
+                        console.error('Chat socket closed unexpectedly');
+                        // Update connection status
+                        let statusDiv = document.getElementById('connection-status');
+                        if (!statusDiv) {
+                            statusDiv = document.createElement('div');
+                            statusDiv.id = 'connection-status';
+                            const container = document.querySelector('.container');
+                            container.insertBefore(statusDiv, container.firstChild.nextSibling);
+                        }
+                        statusDiv.className = 'alert alert-danger mt-2';
+                        statusDiv.innerHTML = 'Connection lost. Please refresh the page to reconnect.';
+                        console.log('WebSocket connection lost. Please refresh the page to reconnect.');
+                    };
+
+                    chatSocket.onerror = function(e) {
+                        console.error('WebSocket error:', e);
+                    };
+
+                    // Send message via WebSocket when form is submitted
+                    let isSubmitting = false; // Prevent double submission
+
+                    document.getElementById('message-form').addEventListener('submit', function(e) {
+                        e.preventDefault();
+
+                        if (isSubmitting) {
+                            console.log('Already submitting, ignoring duplicate submission');
+                            return;
+                        }
+
+                        const messageInput = document.getElementById('message-input');
+                        const message = messageInput.value.trim();
+
+                        if (message) {
+                            isSubmitting = true;
+                            const originalMessage = message; // Store the message
+
+                            // Send via HTTP first for persistence
+                            const formData = new FormData(this);
+                            fetch(this.action, {
+                                method: 'POST',
+                                body: formData,
+                                headers: {
+                                    'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value
+                                }
+                            }).then(response => {
+                                if (response.ok) {
+                                    console.log('Message sent successfully via HTTP');
+                                } else {
+                                    console.error('HTTP send failed:', response.status);
+                                }
+                            }).catch(error => {
+                                console.error('HTTP send failed:', error);
+                            }).finally(() => {
+                                isSubmitting = false; // Reset submission flag
+                            });
+
+                            // Send via WebSocket if connected
+                            if (chatSocket.readyState === WebSocket.OPEN) {
+                                chatSocket.send(JSON.stringify({
+                                    'message': originalMessage
+                                }));
+                                console.log('Message sent via WebSocket');
+                                // Clear input immediately after WebSocket send
+                                messageInput.value = '';
+                            } else {
+                                console.log('WebSocket not connected, cannot send message');
+                                // Don't clear input if WebSocket is not connected
+                                const statusDiv = document.getElementById('connection-status');
+                                if (statusDiv) {
+                                    statusDiv.className = 'alert alert-warning mt-2';
+                                    statusDiv.innerHTML = 'Cannot send message - connection lost. Please refresh the page.';
+                                }
+                                isSubmitting = false;
+                                return;
+                            }
+                        }
+                    });
+                </script>
             </div>
-        </div>
-        <div class="mt-3">
-            <div id="reply-indicator" class="mb-2" style="display: none;">
-                <div class="alert alert-info">
-                    <small>Replying to: <span id="reply-text"></span></small>
-                    <button type="button" class="btn-close float-end" onclick="cancelReply()"></button>
+
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Chat Info</h5>
+                    </div>
+                    <div class="card-body">
+                        {% if conversation.type == 'group' %}
+                            <p><strong>Title:</strong> {{ conversation.title }}</p>
+                            <p><strong>Description:</strong> {{ conversation.groupchat.description|default:"No description" }}</p>
+                            <p><strong>Members:</strong> {{ conversation.groupchat.groupmember_set.count }}</p>
+                        {% else %}
+                            <p><strong>Type:</strong> Private Chat</p>
+                        {% endif %}
+                    </div>
                 </div>
-            </div>
-            <div class="input-group mb-2 flex-column flex-sm-row">
-                <input type="text" id="message" class="form-control" placeholder="Type a message..." aria-label="Type a message">
-                <button class="btn btn-primary mt-2 mt-sm-0" type="button" onclick="sendMessage()">Send</button>
-            </div>
-            <div class="input-group flex-column flex-sm-row">
-                <input type="file" id="file" class="form-control" aria-label="Choose file">
-                <label class="input-group-text mt-2 mt-sm-0" for="file">Attach file</label>
             </div>
         </div>
     </div>
-</div>
-{% endblock %}
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Auto-scroll to bottom of messages
+        const messagesDiv = document.getElementById('messages');
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+        // Submit form on Enter key
+        document.getElementById('message-input').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                document.getElementById('message-form').submit();
+            }
+        });
+
+    </script>
+</body>
+</html>
